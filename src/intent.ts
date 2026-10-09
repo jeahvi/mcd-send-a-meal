@@ -166,7 +166,11 @@ export function defaultMessage(intent: SendIntent): string {
 
 /** 是否命中忌口（用于筛餐） */
 export function conflictsWithAvoid(itemName: string, avoid: string[]): boolean {
-  const spicyWords = ['辣', '麻辣', '香辣', '椒麻', '藤椒'];
+  const spicyWords = [
+    '辣', '麻辣', '香辣', '椒麻', '藤椒',
+    // 实测菜单里带辣但名字不含「辣」字的产品
+    '龙焰', '火辣', '椒香', '韩式辣椒', '墨西哥', '川', '椒',
+  ];
   const friedWords = ['炸', '脆薯', '鸡块', '麦乐鸡'];
   const sugarWords = ['可乐', '雪碧', '甜', '派', '圣代', '新地'];
   const beefWords = ['牛', '巨无霸'];

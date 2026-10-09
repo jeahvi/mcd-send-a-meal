@@ -179,9 +179,32 @@ export async function runSend(opts: SendOptions, client: McdMcpClient): Promise<
     const removed = withName.length - safe.length;
     if (removed > 0) log(`🧮 按忌口「${intent.avoid.join('、')}」过滤掉 ${removed} 款`);
 
+    // ⚠️ 关键：菜单与详情接口都不返回价格，price 恒为 0，
+    //    必须先通过 calculate-price 批量探价，否则预算约束完全失效。
+    await fillPrices(safe, mealArgs, client);
+
     picked = pickCombo(safe, intent);
-    if (!picked.length) warn('未能自动配色，请人工选择');
-    else log(`✅ 已配色：${picked.map((p) => p.name).join(' + ')}`);
+    if (!picked.length) {
+      warn('未能自动配色，请人工选择');
+    } else {
+      log(`✅ 已配色：${picked.map((p) => p.name).join(' + ')}`);
+      // 「实在」护栏：单人一餐明显偏贵时提示，并给出平价替代
+      const est = picked.reduce((s, p) => s + num(p.currentPrice ?? p.price), 0);
+      if (!intent.budget && est > 70) {
+        const cheaper = safe
+          .filter((m) => !picked.includes(m))
+          .filter((m) => /堡|卷/.test(String(m.name ?? '')))
+          .map((m) => ({ m, p: num(m.currentPrice ?? m.price) }))
+          .filter((x) => x.p > 0 && x.p < est)
+          .sort((a, b) => a.p - b.p)[0];
+        if (cheaper) {
+          log(
+            `💡 当前时段可选餐品偏贵（约 ¥${est.toFixed(0)}）。` +
+              `若想更实在，可换「${cheaper.m.name}」(¥${cheaper.p.toFixed(0)})，或用 --budget 指定上限。`
+          );
+        }
+      }
+    }
   } catch (e) {
     warn(`餐品查询失败：${msg(e)}`);
   }
@@ -302,24 +325,159 @@ export async function runSend(opts: SendOptions, client: McdMcpClient): Promise<
   }
 }
 
-/** 简化配色启发式：主食 + 小食 + 饮品，尽量落在预算内 */
+/**
+ * 给候选餐品补上真实单价（元）。
+ *
+ * 麦当劳 MCP 的 query-meals / query-meal-detail 都**不返回价格**，
+ * 只有 calculate-price 能算。这里一次性把候选餐品批量送去算价
+ * （calculate-price 支持 items 数组），把返回的 productList[].subtotal
+ * 按 productCode 回填，从而让「预算约束」真正生效。
+ *
+ * 注意：subtotal 单位是「分」。
+ */
+async function fillPrices(
+  items: MealItem[],
+  mealArgs: Record<string, unknown>,
+  client: McdMcpClient
+): Promise<void> {
+  const candidates = items.filter((m) => m.productCode ?? m.code);
+  if (!candidates.length) return;
+
+  // 每次最多带 20 个，避免请求体过大或触发限流
+  const CHUNK = 20;
+  let filled = 0;
+
+  for (let i = 0; i < candidates.length; i += CHUNK) {
+    const chunk = candidates.slice(i, i + CHUNK);
+    try {
+      const calc = await client.callTool('calculate-price', {
+        ...mealArgs,
+        items: chunk.map((m) => ({ productCode: m.productCode ?? m.code, quantity: 1 })),
+      });
+      const data = (calc as Record<string, unknown>)?.data as Record<string, unknown> | undefined;
+      const pl = Array.isArray(data?.productList)
+        ? (data.productList as Array<Record<string, unknown>>)
+        : [];
+
+      for (const m of chunk) {
+        const code = String(m.productCode ?? m.code ?? '');
+        const hit = pl.find((x) => String(x.productCode) === code);
+        if (hit) {
+          const sub = num(hit.subtotal) || num(hit.originalSubtotal);
+          if (sub > 0) {
+            m.currentPrice = sub / 100; // 分 → 元
+            filled++;
+          }
+        }
+      }
+    } catch {
+      /* 某一批探价失败不影响整体，后续用兜底价 */
+    }
+  }
+
+  if (filled > 0) {
+    log(`💱 已获取 ${filled} 款餐品真实价格`);
+  } else {
+    warn('未能获取餐品价格，预算约束可能不生效');
+  }
+}
+
+/**
+ * 配色启发式：主食 + 小食 + 饮品，优先「实在」而非「显贵」。
+ *
+ * 设计取向（贴合"给爸妈点一份"的场景）：
+ *   1. 排除明显不适合送长辈的品类（多人桶、派对餐、麦金卡专享等）
+ *   2. 主食优先单人份汉堡/卷，避开超大份
+ *   3. 在同一品类内按价格升序，优先选便宜且合适的
+ *   4. 若给了预算，则在预算内尽量凑齐三件
+ */
+
+/** 不适合"一个人吃一顿"的品类关键词（桶、分享装、多人餐等） */
+const BULK_WORDS = ['桶', '分享', '多人', '双人', '家庭', '派对', '全家', '拼盘', '麦金卡', '专享'];
+/** 超大份型主食，单人餐里偏贵且吃不完 */
+const HUGE_WORDS = ['双层', '三件', '四件', '大满贯', '超大', '爆'];
+
+/**
+ * 配件类（蘸酱、风味酱、加料、餐具）：不应作为独立「小食」推荐。
+ * 实测菜单里这类条目很多，若不排除会配出「汉堡 + 一包酱」这种奇怪组合。
+ */
+const CONDIMENT_WORDS = ['酱', '蘸', '风味', '调料', '加料', '餐具', '勺', '叉', '包'];
+
+/** 小食的正向特征 */
+const SIDE_WORDS = ['薯条', '玉米', '沙拉', '鸡块', '派', '小食', '鸡翅', '鸡柳', '薯饼', '麦乐鸡'];
+
 function pickCombo(pool: MealItem[], intent: SendIntent): MealItem[] {
   const name = (m: MealItem) => String(m.name ?? '');
   const price = (m: MealItem) => num(m.currentPrice ?? m.price);
+  const asc = (a: MealItem, b: MealItem) => price(a) - price(b);
 
-  const main = pool.find((m) => /堡|卷|饭|鸡肉|牛肉/.test(name(m)));
-  const side = pool.find((m) => /薯条|玉米|沙拉|鸡块|派/.test(name(m)));
-  const drink = pool.find((m) => /可乐|红茶|咖啡|果汁|奶茶|水/.test(name(m)) && m !== main);
+  // 1. 先剔除多人份 / 大桶类，以及蘸酱调料等配件
+  const isCondiment = (m: MealItem) => CONDIMENT_WORDS.some((w) => name(m).includes(w));
+  let cand = pool.filter((m) => !BULK_WORDS.some((w) => name(m).includes(w)) && !isCondiment(m));
+  if (!cand.length) cand = pool.filter((m) => !isCondiment(m));
+  if (!cand.length) cand = pool; // 兜底
 
-  let combo = [main, side, drink].filter(Boolean) as MealItem[];
-  if (!combo.length) combo = pool.slice(0, 3);
+  // 2. 主食品类：汉堡/卷优先，其次饭；排除超大份
+  const isMain = (m: MealItem) => /堡|卷|饭|鸡肉|牛肉|鸡腿/.test(name(m));
+  const isHuge = (m: MealItem) => HUGE_WORDS.some((w) => name(m).includes(w));
 
-  if (intent.budget) {
-    while (combo.length > 1 && combo.reduce((s, m) => s + price(m), 0) > intent.budget) {
-      combo.pop();
+  const mains = cand.filter((m) => isMain(m) && !isHuge(m)).sort(asc);
+  const mainsLoose = cand.filter(isMain).sort(asc);
+
+  const sides = cand
+    .filter((m) => SIDE_WORDS.some((w) => name(m).includes(w)) && !isMain(m) && !isCondiment(m))
+    .sort(asc);
+  const drinks = cand
+    .filter((m) => /可乐|红茶|咖啡|果汁|奶茶|豆浆|水|饮/.test(name(m)) && !isMain(m))
+    .sort(asc);
+
+  const mainPool = mains.length ? mains : mainsLoose;
+  const main = mainPool[0];
+  const side = sides.find((m) => m !== main);
+  const drink = drinks.find((m) => m !== main && m !== side);
+
+  // 3. 无预算：主食 + 小食 + 饮品；有预算：贪心塞满但绝不超支
+  if (!intent.budget) {
+    const combo = [main, side, drink].filter(Boolean) as MealItem[];
+    return combo.length ? combo : cand.slice().sort(asc).slice(0, 3);
+  }
+
+  const budget = intent.budget;
+  const known = (m: MealItem) => price(m) > 0; // 是否有真实价格
+  const combo: MealItem[] = [];
+  const sum = () => combo.reduce((s, x) => s + price(x), 0);
+  const take = (m?: MealItem) => {
+    if (!m || combo.includes(m)) return;
+    // 未知价格时保守起见不计入（避免超支）
+    if (known(m) && sum() + price(m) > budget) return;
+    combo.push(m);
+  };
+
+  // 主食优先选预算内最合适的：有真实价格时挑最贵但不超预算的（更实在）
+  const mainCandidates = mainPool.filter((m) => !known(m) || price(m) <= budget);
+  const bestMain = known(mainPool[0])
+    ? mainCandidates.sort((a, b) => price(b) - price(a))[0]
+    : mainPool[0];
+  take(bestMain);
+  take(side);
+  take(drink);
+
+  // 仍有富余，用便宜小食把这一顿凑得更实在（不超过预算 90%）
+  if (combo.length) {
+    for (const extra of cand.slice().sort(asc)) {
+      if (combo.length >= 5) break;
+      if (combo.includes(extra)) continue;
+      if (!known(extra)) continue;
+      if (sum() + price(extra) > budget * 0.9) continue;
+      combo.push(extra);
     }
   }
-  return combo;
+
+  if (combo.length) return combo;
+
+  // 预算太低：退回最便宜的若干项
+  const cheap = cand.filter(known).sort(asc);
+  return cheap.length ? [cheap[0]] : cand.slice().sort(asc).slice(0, 1);
 }
 
 // ---------- 小工具 ----------
